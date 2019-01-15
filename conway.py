@@ -136,7 +136,7 @@ class Game:
 
         self.send_state(next_state)
 
-        self.cells = {k: v for k, v in next_state.items() if not v.alive and v.age > 3}
+        self.cells = {k: v for k, v in next_state.items() if v.alive}
 
     def send_state(self, state=None):
         state = state or self.cells
