@@ -1,39 +1,53 @@
 import random
 import time
-from collections import defaultdict
+from functools import partial
 from itertools import chain
-from typing import Generator, Tuple
 
 import requests
 
-white = (255, 255, 255)
-red = (200, 0, 0)
-green = (0, 200, 0)
-blue = (0, 0, 200)
-off = (0, 0, 0)
-pink = (255, 0, 144)
-
-AnyDimensionalTuple = Tuple[int, ...]
-ndt = AnyDimensionalTuple
+from utils import RGBTuple, any_range
+from colors import *
 
 
-def any_range(c1: ndt, c2: ndt) -> Generator[ndt, None, None]:
-    assert len(c1) == len(c2)
-    x, c1 = c1[0], c1[1:]
-    y, c2 = c2[0], c2[1:]
-
-    lower, upper = [(x, y), (y, x)][x > y]
-
-    for n in range(lower, upper + 1):
-        if not (c1 and c2):
-            yield (n,)
-        else:
-            for down in any_range(c1, c2):
-                yield (n, *down)
+def random_colors(n=255):
+    return random.randint(0, n), random.randint(0, n), random.randint(0, n)
 
 
-def random_colors():
-    return random.randint(0, 255), random.randint(0, 255), random.randint(0, 255)
+def one_of_n(value, k=3, other=0):
+    if random.choice(0, k - 1) == 0:
+        return value
+    return other
+
+
+def random_color_decay(cell) -> RGBTuple:
+    if cell.alive:
+        return (70, 70, 70)
+    if cell.age == 1:
+        return (one_of_n(20), one_of_n(20), one_of_n(20))
+    if cell.age < 5:
+        return tuple(map(lambda a: a // 2, cell.last_color))
+    return off
+
+
+def random_color(cell) -> RGBTuple:
+    if cell.alive:
+        return (one_of_n(40), one_of_n(40), one_of_n(40))
+    return off
+
+
+def rainbow_color(cell) -> RGBTuple:
+    if cell.alive:
+        return random.choice(rainbow)
+    return off
+
+
+def muted_rainbow_color(by=4) -> RGBTuple:
+    def colors(cell):
+        if cell.alive:
+            return tuple(map(lambda a: a // by, random.choice(rainbow)))
+        return off
+
+    return colors
 
 
 class Board:
@@ -61,25 +75,24 @@ class Cell:
     age = 0
     total_age = 0
 
-    def __init__(self, alive=False):
+    last_color = None
+
+    def __init__(self, alive=False, color_fn=muted_rainbow_color(by=5)):
         self.alive = alive
+        self.last_color = off
+
+        self.color_fn = partial(color_fn or Cell.color_fn, self)
+
+    def color_fn(self):
+        if self.alive:
+            return (70, 70, 70)
+        return off
 
     @property
     def color(self):
-        if self.alive:
-            return random_colors()
-        # if self.age == 1:
-        #     return (150, 0, 0)
-        # if self.age == 2:
-        #     return (100, 0, 0)
-        # if self.age == 3:
-        #     return (50, 0, 0)
-        return off
-        # if self.alive and self.total_age == 0:
-        #     return green
-        # if self.alive:
-        #     return blue
-        # return off
+        self.last_color = self.color_fn()
+
+        return self.last_color
 
     def step(self, neighbors):
         start_state = self.alive
@@ -106,10 +119,25 @@ class Game:
         self.max_x = x
         self.max_y = y
 
+        self.past_states = []
+
     def surrounding(self, x, y):
         for (cx, cy) in any_range((x - 1, y - 1), (x + 1, y + 1)):
             if cx != x or cy != y:
                 yield cx % self.max_x, cy % self.max_y
+
+    def hash_state(self):
+        alive_cells = (c for c, cell in self.cells.items() if cell.alive)
+        return hash(tuple(sorted(alive_cells)))
+
+    def track_state(self, restart_if_repeated=False):
+
+        this_state = self.hash_state()
+
+        self.past_states = [this_state] + self.past_states[:31]
+
+        if self.past_states.count(this_state) > 5 and restart_if_repeated:
+            self.cells = random_state(40)
 
     def prepare(self):
         populate_queue = []
@@ -121,22 +149,22 @@ class Game:
 
         for c in [c for c in populate_queue if c not in self.cells]:
             self.cells[c] = Cell()
-        # print('added ', len(populate_queue), ' new cells')
 
     def tick(self):
-        # print('total cells: ', len(self.cells))
         self.prepare()
 
         next_state = {}
         for (x, y), cell in self.cells.items():
             surrounding = list(self.surrounding(x, y))
-            # print((x, y), surrounding)
+
             neighbors = sum(self.cells.get(c, Cell()).alive for c in surrounding)
             next_state[x, y] = cell.step(neighbors)
 
         self.send_state(next_state)
 
-        self.cells = {k: v for k, v in next_state.items() if v.alive}
+        self.cells = {k: v for k, v in next_state.items() if v.alive or v.age < 5}
+
+        self.track_state(restart_if_repeated=True)
 
     def send_state(self, state=None):
         state = state or self.cells
@@ -149,29 +177,34 @@ class Game:
         Board.set(cells)
 
 
+def random_state(k=40):
+    all_cells = list(chain(any_range((0, 0), (15, 15))))
+    return {c: Cell(alive=True) for c in random.sample(all_cells, k=k)}
+
+
+def glider(xo=0, yo=0):
+    base = (0, 0), (1, 0), (2, 0), (2, 1), (1, 2)
+    return [(x + xo, y + yo) for x, y in base]
+
+
 def run(x, y):
     game = Game(x, y)
 
-    glider = (         (13, 4),
-                                (14, 3),
-              (12, 2), (13, 2), (14, 2))
+    game.cells.update({c: Cell(alive=True) for c in chain(glider(), glider(4, 4), )})
 
-    second = ((x-8, y+3) for x, y in glider)
-    third = ((x - 1, y + 7) for x, y in glider)
-    fourth = ((x - 9, y + 8) for x, y in glider)
-
-    for c in chain(glider, second, third, fourth):
-        game.cells[c] = Cell(alive=True)
+    game.cells = random_state(40)
 
     game.send_state()
     time.sleep(.1)
     while True:
         game.tick()
-        time.sleep(.1)
+        time.sleep(.02)
 
 
 if __name__ == '__main__':
     try:
         run(16, 16)
     except KeyboardInterrupt:
+        pass
+    finally:
         Board.clear()
