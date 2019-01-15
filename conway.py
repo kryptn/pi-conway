@@ -3,14 +3,23 @@ import time
 from functools import partial
 from itertools import chain
 
-import requests
-
+from boards import HttpBoard
 from utils import RGBTuple, any_range
 from colors import *
 
 
+def random_state(k=40):
+    all_cells = list(chain(any_range((0, 0), (15, 15))))
+    return {c: Cell(alive=True) for c in random.sample(all_cells, k=k)}
+
+
 def random_colors(n=255):
     return random.randint(0, n), random.randint(0, n), random.randint(0, n)
+
+
+def glider(xo=0, yo=0):
+    base = (0, 0), (1, 0), (2, 0), (2, 1), (1, 2)
+    return [(x + xo, y + yo) for x, y in base]
 
 
 def one_of_n(value, k=3, other=0):
@@ -48,26 +57,6 @@ def muted_rainbow_color(by=4) -> RGBTuple:
         return off
 
     return colors
-
-
-class Board:
-    _url = 'http://192.168.1.146:5555'
-
-    _set = f'{_url}/set'
-    _fill = f'{_url}/fill'
-    _clear = f'{_url}/clear'
-
-    @staticmethod
-    def set(colors):
-        return requests.post(Board._set, json={'pixels': colors})
-
-    @staticmethod
-    def fill(color):
-        return requests.post(Board._fill, json={'color': color})
-
-    @staticmethod
-    def clear():
-        return requests.post(Board._clear)
 
 
 class Cell:
@@ -114,12 +103,14 @@ class Cell:
 class Game:
     cells = {}
 
-    def __init__(self, x, y):
+    def __init__(self, x, y, emitter=None):
         self.cells = {}
         self.max_x = x
         self.max_y = y
 
         self.past_states = []
+
+        self.emitter = emitter
 
     def surrounding(self, x, y):
         for (cx, cy) in any_range((x - 1, y - 1), (x + 1, y + 1)):
@@ -140,71 +131,69 @@ class Game:
             self.cells = random_state(40)
 
     def prepare(self):
-        populate_queue = []
+        populate_queue = set()
 
-        for (x, y), cell in self.cells.items():
-            if cell.alive:
-                for coord in [c for c in self.surrounding(x, y) if c not in self.cells]:
-                    populate_queue.append(coord)
+        for (x, y), cell in ((coord, cell) for coord, cell in self.cells.items() if cell.alive):
+            # only check alive cells -- only adjacent cells will come to life
+            for coord in [c for c in self.surrounding(x, y) if c not in self.cells]:
+                populate_queue.add(coord)
 
         for c in [c for c in populate_queue if c not in self.cells]:
+            # only create new cells where none exist -- this preserves the age count
             self.cells[c] = Cell()
 
-    def tick(self):
-        self.prepare()
-
+    def next_state(self):
         next_state = {}
         for (x, y), cell in self.cells.items():
-            surrounding = list(self.surrounding(x, y))
-
-            neighbors = sum(self.cells.get(c, Cell()).alive for c in surrounding)
+            # get the alive neighbors and get the next cell state
+            neighbors = sum(self.cells.get(c, Cell()).alive for c in self.surrounding(x, y))
             next_state[x, y] = cell.step(neighbors)
 
-        self.send_state(next_state)
+        return {k: v for k, v in next_state.items() if v.alive or v.age < 5}
 
-        self.cells = {k: v for k, v in next_state.items() if v.alive or v.age < 5}
+    def tick(self):
+        # buffer any alive cells -- only adjacent will ever come to life
+        self.prepare()
 
+        # get the next game state
+        self.cells = self.next_state()
+
+        # trigger any emitter
+        self.emit_state()
+
+        # determine if the game is terminal
         self.track_state(restart_if_repeated=True)
 
-    def send_state(self, state=None):
-        state = state or self.cells
+    def emit_state(self):
+        emitter = self.emitter
+        if not emitter:
+            return
+
+        state = self.cells
 
         all_cells = {coord: Cell() for coord in any_range((0, 0), (self.max_x - 1, self.max_y - 1))}
         all_cells.update(state)
 
         cells = [((x, y), c.color) for (x, y), c in all_cells.items()]
 
-        Board.set(cells)
+        emitter(cells)
 
 
-def random_state(k=40):
-    all_cells = list(chain(any_range((0, 0), (15, 15))))
-    return {c: Cell(alive=True) for c in random.sample(all_cells, k=k)}
 
+def runner(x, y, board, delay=0.03, start_alive=40):
+    game = Game(x, y, emitter=board.set)
 
-def glider(xo=0, yo=0):
-    base = (0, 0), (1, 0), (2, 0), (2, 1), (1, 2)
-    return [(x + xo, y + yo) for x, y in base]
+    game.cells = random_state(start_alive)
 
-
-def run(x, y):
-    game = Game(x, y)
-
-    game.cells.update({c: Cell(alive=True) for c in chain(glider(), glider(4, 4), )})
-
-    game.cells = random_state(40)
-
-    game.send_state()
-    time.sleep(.1)
-    while True:
-        game.tick()
-        time.sleep(.02)
-
-
-if __name__ == '__main__':
     try:
-        run(16, 16)
+        while True:
+            game.tick()
+            time.sleep(delay)
     except KeyboardInterrupt:
         pass
     finally:
-        Board.clear()
+        board.clear()
+
+
+if __name__ == '__main__':
+    runner(16, 16, HttpBoard)
